@@ -33,17 +33,16 @@ static esp_zb_zcl_attr_t custom_cluster_attrs[] = {
     }
 };
 
-static esp_zb_cluster_list_t *create_custom_cluster()
+// Zmieniona funkcja: dodaje atrybuty bezpośrednio do istniejącej listy
+static void add_custom_cluster(esp_zb_cluster_list_t *cluster_list)
 {
-    esp_zb_cluster_list_t *cluster = esp_zb_zcl_cluster_list_create();
     esp_zb_zcl_cluster_add_custom_cluster(
-        cluster,
+        cluster_list,
         CUSTOM_CLUSTER_ID,
         ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
         custom_cluster_attrs,
         sizeof(custom_cluster_attrs) / sizeof(custom_cluster_attrs[0])
     );
-    return cluster;
 }
 
 // -----------------------------
@@ -56,7 +55,7 @@ void init_vl53()
     sensor.setTimeout(500);
     if (!sensor.init()) {
         Serial.println("VL53L1X init failed!");
-        while (1);
+        while (1) { delay(1000); } // Zapobiega resetom Watchdoga
     }
 
     sensor.setDistanceMode(VL53L1X::Short);   // do ~1 m
@@ -101,9 +100,8 @@ static esp_zb_ep_list_t *create_endpoint()
     // Identify
     esp_zb_zcl_identify_cluster_add(cluster_list, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 
-    // Custom cluster
-    esp_zb_cluster_list_t *custom = create_custom_cluster();
-    esp_zb_cluster_list_add_custom_cluster(cluster_list, custom);
+    // Custom cluster - użycie poprawionej funkcji
+    add_custom_cluster(cluster_list);
 
     // Endpoint 1
     esp_zb_ep_list_add_ep(
@@ -135,19 +133,22 @@ void setup()
 }
 
 // -----------------------------
-// LOOP – logika threshold + limit 1 m
+// LOOP
 // -----------------------------
 void loop()
 {
-    uint16_t new_mm = sensor.read();
+    // Odczyt nieblokujący - chroni stos Zigbee i Watchdoga
+    if (sensor.dataReady()) {
+        uint16_t new_mm = sensor.read(false); 
 
-    if (new_mm > 1000) new_mm = 1000;  // limit 1 m
+        if (new_mm > 1000) new_mm = 1000;  // limit 1 m
 
-    if (abs((int)new_mm - (int)last_distance_mm) >= threshold_mm) {
-        distance_mm = new_mm;
-        report_distance(distance_mm);
-        last_distance_mm = new_mm;
-        Serial.printf("Reported distance: %u mm\n", distance_mm);
+        if (abs((int)new_mm - (int)last_distance_mm) >= threshold_mm) {
+            distance_mm = new_mm;
+            report_distance(distance_mm);
+            last_distance_mm = new_mm;
+            Serial.printf("Reported distance: %u mm\n", distance_mm);
+        }
     }
 
     esp_zb_main_loop_iteration();
