@@ -8,16 +8,28 @@
 #include "esp_zigbee_endpoint.h"
 #include "esp_zigbee_device.h"
 
-#define ZIGBEE_MODE ZIGBEE_MODE_ED
-#define CUSTOM_CLUSTER_ID 0xFC00
-#define CUSTOM_ATTR_DISTANCE 0x0001
+// -----------------------------
+// Konfiguracja Zigbee
+// -----------------------------
+#define ZIGBEE_MODE             ZIGBEE_MODE_ED
+#define CUSTOM_CLUSTER_ID       0xFC00
+#define CUSTOM_ATTR_DISTANCE    0x0001
+
+// -----------------------------
+// Konfiguracja VL53L1X
+// -----------------------------
+#define VL53L1X_TIMING_BUDGET_US    20000   // 20 ms – balans między prędkością a dokładnością
+#define VL53L1X_POLL_INTERVAL_MS    50      // co 50 ms nowy pomiar
+#define VL53L1X_MAX_DISTANCE_MM     1000    // limit trybu Short (~1 m)
+#define VL53L1X_ROI_SIZE            8       // zawężenie wiązki SPAD do ~15°
+#define VL53L1X_ROI_CENTER          199     // środek matrycy SPAD (centrum optyczne)
+#define REPORT_THRESHOLD_MM         10      // min. zmiana do wysłania raportu Zigbee
 
 // -----------------------------
 // Zmienne pomiarowe
 // -----------------------------
-uint16_t distance_mm = 0;
-uint16_t last_distance_mm = 0;
-const uint16_t threshold_mm = 10;   // raportowanie przy zmianie > 10 mm
+static uint16_t distance_mm      = 0;
+static uint16_t last_distance_mm = 0;
 
 VL53L1X sensor;
 
@@ -26,14 +38,13 @@ VL53L1X sensor;
 // -----------------------------
 static esp_zb_zcl_attr_t custom_cluster_attrs[] = {
     {
-        .id = CUSTOM_ATTR_DISTANCE,
-        .type = ESP_ZB_ZCL_ATTR_TYPE_U16,
+        .id     = CUSTOM_ATTR_DISTANCE,
+        .type   = ESP_ZB_ZCL_ATTR_TYPE_U16,
         .access = ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY,
-        .value = &distance_mm
+        .value  = &distance_mm   // wskaźnik na globalną zmienną – zawsze aktualizuj distance_mm PRZED raportem
     }
 };
 
-// Zmieniona funkcja: dodaje atrybuty bezpośrednio do istniejącej listy
 static void add_custom_cluster(esp_zb_cluster_list_t *cluster_list)
 {
     esp_zb_zcl_cluster_add_custom_cluster(
@@ -46,44 +57,103 @@ static void add_custom_cluster(esp_zb_cluster_list_t *cluster_list)
 }
 
 // -----------------------------
-// VL53L1X – inicjalizacja
+// Konfiguracja automatycznego raportowania atrybutu
 // -----------------------------
-void init_vl53()
+static void configure_reporting()
 {
-    Wire.begin();
+    esp_zb_zcl_reporting_info_t rep_info = {
+        .direction    = ESP_ZB_ZCL_CMD_DIRECTION_TO_SRV,
+        .ep           = 1,
+        .cluster_id   = CUSTOM_CLUSTER_ID,
+        .cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+        .attr_id      = CUSTOM_ATTR_DISTANCE,
+        .u            = {
+            .send_info = {
+                .min_interval = 1,      // min 1 s między raportami
+                .max_interval = 60,     // wymuś raport co 60 s nawet bez zmiany
+                .delta        = { .u16 = REPORT_THRESHOLD_MM },
+                .def_min_interval = 1,
+                .def_max_interval = 60
+            }
+        },
+        .dst = {
+            .profile_id = ESP_ZB_AF_HA_PROFILE_ID
+        },
+        .manuf_code = ESP_ZB_ZCL_ATTR_NON_MANUFACTURER_SPECIFIC
+    };
 
-    sensor.setTimeout(500);
-    if (!sensor.init()) {
-        Serial.println("VL53L1X init failed!");
-        while (1) { delay(1000); } // Zapobiega resetom Watchdoga
-    }
-
-    sensor.setDistanceMode(VL53L1X::Short);   // do ~1 m
-    sensor.setMeasurementTimingBudget(20000); // 20 ms
-
-    sensor.setROISize(8, 8);      // zawężenie wiązki do ~15°
-    sensor.setROICenter(199);     // środek matrycy
-
-    sensor.startContinuous(50);   // pomiar co 50 ms
+    esp_zb_update_reporting_info(&rep_info);
 }
 
 // -----------------------------
-// Raportowanie Zigbee
+// Handler zdarzeń Zigbee (join, leave, rejoin)
 // -----------------------------
-void report_distance(uint16_t mm)
+static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id, const void *message)
 {
+    switch (callback_id) {
+        case ESP_ZB_CORE_NETWORK_STEERING_CB_ID:
+            Serial.println("[Zigbee] Network steering complete");
+            configure_reporting();  // konfiguruj reporting po dołączeniu do sieci
+            break;
+        case ESP_ZB_CORE_DEVICE_CB_ID:
+            Serial.println("[Zigbee] Device callback");
+            break;
+        default:
+            Serial.printf("[Zigbee] Unhandled callback: %d\n", callback_id);
+            break;
+    }
+    return ESP_OK;
+}
+
+// -----------------------------
+// Raportowanie Zigbee (z blokadą stosu)
+// -----------------------------
+static void report_distance(uint16_t mm)
+{
+    // Aktualizuj globalną zmienną wskazywaną przez atrybut
+    distance_mm = mm;
+
+    esp_zb_lock_acquire(portMAX_DELAY);
+
     esp_zb_zcl_status_t status = esp_zb_zcl_set_attribute_val(
         1,
         CUSTOM_CLUSTER_ID,
         ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
         CUSTOM_ATTR_DISTANCE,
-        &mm,
+        &distance_mm,
         false
     );
 
     if (status == ESP_ZB_ZCL_STATUS_SUCCESS) {
         esp_zb_zcl_report_attr(1, CUSTOM_CLUSTER_ID, CUSTOM_ATTR_DISTANCE);
+    } else {
+        Serial.printf("[Zigbee] set_attribute_val failed: %d\n", status);
     }
+
+    esp_zb_lock_release();
+}
+
+// -----------------------------
+// VL53L1X – inicjalizacja
+// -----------------------------
+static void init_vl53()
+{
+    Wire.begin();
+
+    sensor.setTimeout(500);
+    if (!sensor.init()) {
+        Serial.println("[VL53L1X] Init failed! Restarting...");
+        delay(2000);
+        esp_restart();  // twardy reset zamiast pętli blokującej
+    }
+
+    sensor.setDistanceMode(VL53L1X::Short);
+    sensor.setMeasurementTimingBudget(VL53L1X_TIMING_BUDGET_US);
+    sensor.setROISize(VL53L1X_ROI_SIZE, VL53L1X_ROI_SIZE);
+    sensor.setROICenter(VL53L1X_ROI_CENTER);
+    sensor.startContinuous(VL53L1X_POLL_INTERVAL_MS);
+
+    Serial.println("[VL53L1X] Initialized OK");
 }
 
 // -----------------------------
@@ -91,28 +161,22 @@ void report_distance(uint16_t mm)
 // -----------------------------
 static esp_zb_ep_list_t *create_endpoint()
 {
-    esp_zb_ep_list_t *ep = esp_zb_ep_list_create();
+    esp_zb_ep_list_t *ep_list          = esp_zb_ep_list_create();
     esp_zb_cluster_list_t *cluster_list = esp_zb_zcl_cluster_list_create();
 
-    // Basic
     esp_zb_zcl_basic_cluster_add(cluster_list, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
-
-    // Identify
     esp_zb_zcl_identify_cluster_add(cluster_list, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
-
-    // Custom cluster - użycie poprawionej funkcji
     add_custom_cluster(cluster_list);
 
-    // Endpoint 1
     esp_zb_ep_list_add_ep(
-        ep,
+        ep_list,
         cluster_list,
         1,
         ESP_ZB_AF_HA_PROFILE_ID,
         ESP_ZB_HA_CUSTOM_ATTR_DEVICE_ID
     );
 
-    return ep;
+    return ep_list;
 }
 
 // -----------------------------
@@ -126,10 +190,14 @@ void setup()
     esp_zb_cfg_t zb_nwk_cfg = ESP_ZB_ZED_CONFIG();
     esp_zb_init(&zb_nwk_cfg);
 
+    // Rejestracja handlera zdarzeń – musi być przed esp_zb_start()
+    esp_zb_core_action_handler_register(zb_action_handler);
+
     esp_zb_ep_list_t *ep = create_endpoint();
     esp_zb_device_register(ep);
 
     esp_zb_start(true);
+    Serial.println("[Zigbee] Stack started");
 }
 
 // -----------------------------
@@ -137,17 +205,30 @@ void setup()
 // -----------------------------
 void loop()
 {
-    // Odczyt nieblokujący - chroni stos Zigbee i Watchdoga
     if (sensor.dataReady()) {
-        uint16_t new_mm = sensor.read(false); 
+        uint16_t new_mm = sensor.read(false);  // false = nie resetuj licznika timeoutu
 
-        if (new_mm > 1000) new_mm = 1000;  // limit 1 m
+        // Sprawdź timeout sensora
+        if (sensor.timeoutOccurred()) {
+            Serial.println("[VL53L1X] Timeout!");
+            esp_zb_main_loop_iteration();
+            return;
+        }
 
-        if (abs((int)new_mm - (int)last_distance_mm) >= threshold_mm) {
-            distance_mm = new_mm;
-            report_distance(distance_mm);
+        // Ogranicz do zakresu trybu Short
+        if (new_mm > VL53L1X_MAX_DISTANCE_MM) {
+            new_mm = VL53L1X_MAX_DISTANCE_MM;
+        }
+
+        // Wyślij raport tylko przy wystarczającej zmianie odległości
+        uint16_t diff = (new_mm > last_distance_mm)
+                        ? new_mm - last_distance_mm
+                        : last_distance_mm - new_mm;
+
+        if (diff >= REPORT_THRESHOLD_MM) {
+            report_distance(new_mm);
             last_distance_mm = new_mm;
-            Serial.printf("Reported distance: %u mm\n", distance_mm);
+            Serial.printf("[VL53L1X] Reported distance: %u mm\n", new_mm);
         }
     }
 
