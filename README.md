@@ -1,6 +1,6 @@
 # XIAO ESP32‑C6 Zigbee Distance Sensor (VL53L1X)
 
-Custom Zigbee distance sensor based on **Seeed Studio XIAO ESP32‑C6** and **VL53L1X ToF**.  
+Custom Zigbee distance sensor based on [**Seeed Studio XIAO ESP32‑C6**](https://wiki.seeedstudio.com/xiao_esp32c6_getting_started/) and **VL53L1X ToF**.  
 Urządzenie działa jako **Zigbee End Device**, integruje się z **Home Assistant (ZHA)** i raportuje dystans w milimetrach poprzez **custom cluster 0xFC00**.
 
 ## ✨ Funkcje
